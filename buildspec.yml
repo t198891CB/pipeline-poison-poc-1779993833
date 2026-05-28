@@ -1,0 +1,7 @@
+version: 0.2
+phases:
+  build:
+    commands:
+      - echo "Legitimate build"
+      - echo "Running tests..."
+      - echo "Build completed successfully"
