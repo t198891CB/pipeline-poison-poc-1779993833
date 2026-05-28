@@ -1,0 +1,12 @@
+{
+  "app.title": "Application",
+  "app.welcome": "Welcome to our platform",
+  "app.login": "Sign In",
+  "app.logout": "Sign Out",
+  "nav.home": "Home",
+  "nav.settings": "Settings",
+  "nav.profile": "Profile",
+  "locale.code": "lg",
+  "locale.name": "Ganda",
+  "locale.direction": "ltr"
+}
